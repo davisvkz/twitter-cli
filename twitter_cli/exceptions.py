@@ -48,6 +48,18 @@ class QueryIdError(TwitterError):
     error_code = "query_id_error"
 
 
+class SchemaError(TwitterError):
+    """Raised when a GraphQL response no longer matches any known shape.
+
+    Distinct from "zero results": this means the parser could not even find
+    the instructions list it expects, which usually means Twitter changed
+    its response schema rather than that the query legitimately matched
+    nothing.
+    """
+
+    error_code = "schema_error"
+
+
 class MediaUploadError(TwitterError):
     """Raised when media upload fails (file not found, too large, unsupported format, API error)."""
 

@@ -27,7 +27,8 @@ error:
 - `--yaml` and `--json` both use this envelope
 - non-TTY stdout defaults to YAML
 - tweet and user lists are returned under `data`
-- timeline-style list commands may also return `pagination.nextCursor`
+- timeline-style list commands (`feed`, `list`, `search`) may also return `pagination.nextCursor`
+- `search --type People` returns a user list under `data` (same shape as `followers`/`following`) — it does not support `--cursor`, advanced query operators, `--filter`, `--full-text`, or `--compact`
 - `article` returns a single tweet object under `data`
 - `status` returns `data.authenticated` plus `data.user`
 - `whoami` returns `data.user`
@@ -55,3 +56,6 @@ Common structured error codes:
 - `invalid_input`
 - `rate_limited`
 - `api_error`
+- `schema_error` — the Twitter API response no longer matched any known shape.
+  Usually means twitter-cli needs updating, not that the query was wrong.
+  Currently only raised by `search`.

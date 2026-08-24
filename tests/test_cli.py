@@ -677,10 +677,10 @@ def test_cli_search_advanced_options(monkeypatch) -> None:
     captured = {}
 
     class FakeClient:
-        def fetch_search(self, query: str, count: int, product: str):
+        def fetch_search(self, query: str, count: int, product: str, cursor=None, return_cursor=False):
             captured["query"] = query
             captured["product"] = product
-            return []
+            return [], None
 
     monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
     monkeypatch.setattr(
@@ -713,9 +713,9 @@ def test_cli_search_operators_only_no_query(monkeypatch) -> None:
     captured = {}
 
     class FakeClient:
-        def fetch_search(self, query: str, count: int, product: str):
+        def fetch_search(self, query: str, count: int, product: str, cursor=None, return_cursor=False):
             captured["query"] = query
-            return []
+            return [], None
 
     monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
     monkeypatch.setattr(
@@ -753,6 +753,137 @@ def test_cli_search_rejects_reversed_date_range(monkeypatch) -> None:
     result = runner.invoke(cli, ["search", "python", "--since", "2026-03-02", "--until", "2026-03-01"])
     assert result.exit_code != 0
     assert "--since must be on or before --until" in result.output
+
+
+def test_cli_search_accepts_cursor_and_emits_pagination(monkeypatch, tweet_factory) -> None:
+    class FakeClient:
+        def fetch_search(self, query: str, count: int, product: str, cursor=None, return_cursor=False):
+            assert query == "AI"
+            assert count == 20
+            assert product == "Latest"
+            assert cursor == "cursor-prev"
+            assert return_cursor is True
+            return [tweet_factory("1")], "cursor-next"
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["search", "AI", "-t", "Latest", "--cursor", "cursor-prev", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"][0]["id"] == "1"
+    assert payload["pagination"]["nextCursor"] == "cursor-next"
+
+
+def test_cli_bookmarks_structured_output_has_no_pagination_key(monkeypatch, tweet_factory) -> None:
+    """Non-paginated `_fetch_and_display` callers must not gain a `pagination` key."""
+    class FakeClient:
+        def fetch_bookmarks(self, count: int):
+            return [tweet_factory("1")]
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["bookmarks", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert "pagination" not in payload
+
+
+def test_cli_search_people_returns_users(monkeypatch) -> None:
+    class FakeClient:
+        def fetch_search_users(self, query: str, count: int):
+            assert query == "openai"
+            assert count == 20
+            return [UserProfile(id="1", name="OpenAI", screen_name="openai", verified=True)]
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["search", "openai", "-t", "People", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["schema_version"] == "1"
+    assert payload["data"][0]["screenName"] == "openai"
+    assert payload["data"][0]["verified"] is True
+    assert "pagination" not in payload
+
+
+def test_cli_search_people_case_insensitive_type(monkeypatch) -> None:
+    class FakeClient:
+        # Deliberately no fetch_search — if the tweet path were taken, this
+        # would raise AttributeError instead of returning a user payload.
+        def fetch_search_users(self, query: str, count: int):
+            return [UserProfile(id="1", name="OpenAI", screen_name="openai")]
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["search", "openai", "-t", "people", "--json"])
+    assert result.exit_code == 0, result.output
+
+
+def test_cli_search_people_requires_query() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["search", "-t", "People"])
+    assert result.exit_code != 0
+    assert "requires a QUERY" in result.output
+
+
+@pytest.mark.parametrize(
+    "flag_args",
+    [
+        ["--from", "bbc"],
+        ["--lang", "en"],
+        ["--since", "2026-01-01"],
+        ["--min-likes", "10"],
+        ["--has", "links"],
+        ["--filter"],
+        ["--full-text"],
+        ["--cursor", "abc"],
+    ],
+)
+def test_cli_search_people_rejects_tweet_only_flags(flag_args) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["search", "openai", "-t", "People"] + flag_args)
+    assert result.exit_code != 0
+    assert "--type People" in result.output
+
+
+def test_cli_search_people_rejects_compact() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["-c", "search", "openai", "-t", "People"])
+    assert result.exit_code != 0
+    assert "--compact" in result.output
+
+
+def test_cli_search_help_lists_people() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["search", "--help"])
+    assert result.exit_code == 0
+    assert "People" in result.output
 
 
 def test_cli_compact_mode(tmp_path, tweet_factory) -> None:

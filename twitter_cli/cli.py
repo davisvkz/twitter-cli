@@ -8,6 +8,7 @@ Read commands:
     twitter bookmarks folders <id>    # tweets in a folder
     twitter search "query"            # search tweets
     twitter search "query" --from user  # advanced search
+    twitter search "query" -t People  # search accounts
     twitter user elonmusk             # user profile
     twitter user-posts elonmusk       # user tweets
     twitter likes elonmusk            # user likes
@@ -80,6 +81,7 @@ from .serialization import (
     tweets_to_json,
     user_profile_to_dict,
     users_to_data,
+    users_to_json,
 )
 
 ConfigDict = Dict[str, Any]
@@ -93,7 +95,7 @@ WriteOperation = Callable[[TwitterClient], WritePayload]
 logger = logging.getLogger(__name__)
 console = Console(stderr=True)
 FEED_TYPES = ["for-you", "following"]
-SEARCH_PRODUCTS = ["Top", "Latest", "Photos", "Videos"]
+SEARCH_PRODUCTS = ["Top", "Latest", "People", "Photos", "Videos"]
 SEARCH_HAS_CHOICES = ["links", "images", "videos", "media"]
 SEARCH_EXCLUDE_CHOICES = ["retweets", "replies", "links"]
 
@@ -305,18 +307,27 @@ def cli(ctx, verbose, compact):
     ctx.obj["compact"] = compact
 
 
-def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, output_file, do_filter, config=None, compact=False, full_text=False):
-    # type: (Any, str, str, Optional[int], bool, bool, Optional[str], bool, Optional[dict], bool, bool) -> None
-    """Common fetch-filter-display logic for timeline-like commands."""
+def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, output_file, do_filter, config=None, compact=False, full_text=False, paginated=False):
+    # type: (Any, str, str, Optional[int], bool, bool, Optional[str], bool, Optional[dict], bool, bool, bool) -> None
+    """Common fetch-filter-display logic for timeline-like commands.
+
+    When `paginated` is True, `fetch_fn(count)` must return `(tweets,
+    next_cursor)` and the structured payload includes `pagination.nextCursor`
+    (see `_emit_timeline_structured`) instead of a bare tweet list.
+    """
     if config is None:
         config = load_config()
     rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml, compact=compact)
+    next_cursor = None  # type: Optional[str]
     try:
         fetch_count = _resolve_configured_count(config, max_count)
         if rich_output:
             console.print("%s Fetching %s (%d tweets)...\n" % (emoji, label, fetch_count))
         start = time.time()
-        tweets = fetch_fn(fetch_count)
+        if paginated:
+            tweets, next_cursor = fetch_fn(fetch_count)
+        else:
+            tweets = fetch_fn(fetch_count)
         elapsed = time.time() - start
         if rich_output:
             console.print("✅ Fetched %d %s in %.1fs\n" % (len(tweets), label, elapsed))
@@ -336,7 +347,11 @@ def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, outp
 
     save_tweet_cache(filtered)
 
-    if emit_structured(tweets_to_data(filtered), as_json=as_json, as_yaml=as_yaml):
+    if paginated:
+        emitted = _emit_timeline_structured(filtered, next_cursor, as_json=as_json, as_yaml=as_yaml)
+    else:
+        emitted = emit_structured(tweets_to_data(filtered), as_json=as_json, as_yaml=as_yaml)
+    if emitted:
         return
 
     print_tweet_table(
@@ -723,7 +738,7 @@ def user_posts(ctx, screen_name, max_count, as_json, as_yaml, output_file, full_
     "product",
     type=click.Choice(SEARCH_PRODUCTS, case_sensitive=False),
     default="Top",
-    help="Search tab: Top, Latest, Photos, or Videos.",
+    help="Search tab: Top, Latest, People (accounts), Photos, or Videos.",
 )
 @click.option("--from", "from_user", type=str, default=None, help="Only tweets from this user.")
 @click.option("--to", "to_user", type=str, default=None, help="Only tweets directed at this user.")
@@ -745,16 +760,18 @@ def user_posts(ctx, screen_name, max_count, as_json, as_yaml, output_file, full_
 @click.option("--min-likes", type=click.IntRange(min=0), default=None, help="Minimum number of likes.")
 @click.option("--min-retweets", type=click.IntRange(min=0), default=None, help="Minimum number of retweets.")
 @click.option("--max", "-n", "max_count", type=int, default=None, help="Max number of tweets to fetch.")
+@click.option("--cursor", type=str, default=None, help="Pagination cursor for continuing a previous search request.")
 @structured_output_options
 @click.option("--output", "-o", "output_file", type=str, default=None, help="Save tweets to JSON file.")
 @click.option("--filter", "do_filter", is_flag=True, help="Enable score-based filtering.")
 @click.option("--full-text", is_flag=True, help="Show full tweet text in table output.")
 @click.pass_context
-def search(ctx, query, product, from_user, to_user, lang, since, until, has, exclude, min_likes, min_retweets, max_count, as_json, as_yaml, output_file, do_filter, full_text):
-    # type: (Any, str, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], tuple, tuple, Optional[int], Optional[int], int, bool, bool, Optional[str], bool, bool) -> None
+def search(ctx, query, product, from_user, to_user, lang, since, until, has, exclude, min_likes, min_retweets, max_count, cursor, as_json, as_yaml, output_file, do_filter, full_text):
+    # type: (Any, str, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], tuple, tuple, Optional[int], Optional[int], int, Optional[str], bool, bool, Optional[str], bool, bool) -> None
     """Search tweets by QUERY string with optional advanced filters.
 
-    QUERY is the search keywords (optional when using advanced filters).
+    QUERY is the search keywords (optional when using advanced filters,
+    except with --type People, which requires a QUERY).
 
     Advanced search examples:
 
@@ -763,7 +780,36 @@ def search(ctx, query, product, from_user, to_user, lang, since, until, has, exc
       twitter search "AI" --lang en --since 2026-01-01
       twitter search "rust" --has links --min-likes 100
       twitter search --from bbc --exclude retweets
+      twitter search "python" --cursor "<next-cursor-from-previous-response>"
+      twitter search "openai" -t People --json
     """
+    compact = ctx.obj.get("compact", False)
+    is_people = product.lower() == "people"
+
+    if is_people:
+        unsupported = [
+            name
+            for name, value in (
+                ("--from", from_user), ("--to", to_user), ("--lang", lang),
+                ("--since", since), ("--until", until),
+                ("--has", has), ("--exclude", exclude),
+                ("--min-likes", min_likes is not None), ("--min-retweets", min_retweets is not None),
+                ("--cursor", cursor),
+                ("--filter", do_filter), ("--full-text", full_text),
+            )
+            if value
+        ]
+        if unsupported:
+            raise click.UsageError(
+                "`--type People` searches accounts and does not support %s." % ", ".join(unsupported)
+            )
+        if compact:
+            raise click.UsageError("`twitter search --type People` does not support --compact. Use --json or --yaml.")
+        if not query.strip():
+            raise click.UsageError("`--type People` requires a QUERY.")
+        _run_people_search(query.strip(), max_count, as_json, as_yaml, output_file)
+        return
+
     from .search import build_search_query
 
     try:
@@ -784,15 +830,16 @@ def search(ctx, query, product, from_user, to_user, lang, since, until, has, exc
     if not composed_query:
         raise click.UsageError("Provide a QUERY or at least one advanced filter (e.g. --from, --lang).")
 
-    compact = ctx.obj.get("compact", False)
     config = load_config()
     def _run():
         rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml, compact=compact)
         client = _get_client(config, quiet=not rich_output)
         _fetch_and_display(
-            lambda count: client.fetch_search(composed_query, count, product),
+            lambda count: client.fetch_search(
+                composed_query, count, product, cursor=cursor, return_cursor=True,
+            ),
             "'%s' (%s)" % (composed_query, product), "🔍", max_count, as_json, as_yaml, output_file, do_filter, config,
-            compact=compact, full_text=full_text,
+            compact=compact, full_text=full_text, paginated=True,
         )
     _run_guarded(_run)
 
@@ -1062,6 +1109,15 @@ def list_timeline(ctx, list_id, max_count, cursor, as_json, as_yaml, do_filter, 
     _run_guarded(_run)
 
 
+def _emit_user_list(users, title, *, as_json, as_yaml):
+    # type: (List[UserProfile], str, bool, bool) -> None
+    """Shared structured/table emission for a list of user profiles."""
+    if emit_structured(users_to_data(users), as_json=as_json, as_yaml=as_yaml):
+        return
+    print_user_table(users, console, title=title)
+    console.print()
+
+
 def _fetch_and_display_users(
     screen_name: str,
     fetch_fn_name: str,
@@ -1090,11 +1146,32 @@ def _fetch_and_display_users(
     except (TwitterError, RuntimeError) as exc:
         _exit_with_error(exc)
 
-    if emit_structured(users_to_data(users), as_json=as_json, as_yaml=as_yaml):
-        return
+    _emit_user_list(users, "👥 @%s %s — %d" % (screen_name, label, len(users)), as_json=as_json, as_yaml=as_yaml)
 
-    print_user_table(users, console, title="👥 @%s %s — %d" % (screen_name, label, len(users)))
-    console.print()
+
+def _run_people_search(query, max_count, as_json, as_yaml, output_file):
+    # type: (str, Optional[int], bool, bool, Optional[str]) -> None
+    """Fetch and render the People search tab (accounts, not tweets)."""
+    config = load_config()
+
+    def _run():
+        rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml)
+        client = _get_client(config, quiet=not rich_output)
+        fetch_count = _resolve_configured_count(config, max_count)
+        if rich_output:
+            console.print("🔍 Searching people for '%s' (%d)...\n" % (query, fetch_count))
+        start = time.time()
+        users = client.fetch_search_users(query, fetch_count)
+        elapsed = time.time() - start
+        if rich_output:
+            console.print("✅ Found %d accounts in %.1fs\n" % (len(users), elapsed))
+        if output_file:
+            Path(output_file).write_text(users_to_json(users), encoding="utf-8")
+            if rich_output:
+                console.print("💾 Saved to %s\n" % output_file)
+        _emit_user_list(users, "👥 People — '%s' (%d)" % (query, len(users)), as_json=as_json, as_yaml=as_yaml)
+
+    _run_guarded(_run)
 
 
 @cli.command()

@@ -117,6 +117,8 @@ twitter search "python" --from elonmusk --lang en --since 2026-01-01
 twitter search --from bbc --exclude retweets --has links
 twitter search "topic" -o results.json         # Save to file
 twitter search "trending" --filter              # Apply ranking filter
+twitter search "AI agent" --cursor "<next-cursor-from-previous-response>"
+twitter search "openai" -t People --json        # Search accounts, not tweets
 
 # Tweet detail (view tweet + replies)
 twitter tweet 1234567890
@@ -441,6 +443,8 @@ twitter search "AI agent" -t Latest --max 50
 twitter search "AI agent" --full-text
 twitter search "topic" -o results.json         # 保存到文件
 twitter search "trending" --filter              # 启用排序筛选
+twitter search "AI agent" --cursor "<上一页返回的 nextCursor>"
+twitter search "openai" -t People --json        # 搜索账号而非推文
 
 # 推文详情
 twitter tweet 1234567890

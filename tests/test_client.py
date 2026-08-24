@@ -16,7 +16,7 @@ from twitter_cli.client import (
     _best_chrome_target,
     TwitterClient,
 )
-from twitter_cli.exceptions import TwitterAPIError
+from twitter_cli.exceptions import SchemaError, TwitterAPIError
 from twitter_cli.graphql import (
     FEATURES,
     FALLBACK_QUERY_IDS,
@@ -366,7 +366,7 @@ class TestPaginationBehavior:
         def _graphql_get(operation_name, variables, features, field_toggles=None):
             return next(responses)
 
-        def _parse_timeline_response(data, get_instructions):
+        def _parse_timeline_response(data, get_instructions, context=None):
             if data["page"] == 1:
                 return [], "cursor-2"
             return [MagicMock(id="tweet-1")], None
@@ -450,6 +450,34 @@ class TestPaginationBehavior:
         assert cursor == "cursor-next"
         assert calls[0][0] == "ListLatestTweetsTimeline"
         assert calls[0][1]["listId"] == "list-1"
+        assert calls[0][1]["cursor"] == "cursor-prev"
+
+    def test_fetch_search_accepts_cursor_and_returns_cursor(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+
+        calls = []
+
+        def _graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables.copy()))
+            return {"data": {"search_by_raw_query": {"search_timeline": {"timeline": {"instructions": []}}}}}
+
+        client._graphql_post = _graphql_post
+
+        tweet = MagicMock(id="tweet-1")
+        with patch('twitter_cli.client.parse_timeline_response', return_value=([tweet], "cursor-next")):
+            tweets, cursor = client.fetch_search(
+                "AI",
+                1,
+                cursor="cursor-prev",
+                return_cursor=True,
+            )
+
+        assert [item.id for item in tweets] == ["tweet-1"]
+        assert cursor == "cursor-next"
+        assert calls[0][0] == "SearchTimeline"
+        assert calls[0][1]["rawQuery"] == "AI"
         assert calls[0][1]["cursor"] == "cursor-prev"
 
     def test_user_list_continues_when_cursor_advances_without_new_users(self):
@@ -1545,3 +1573,87 @@ class TestFetchSearchUsesPost:
 
         assert captured.get("product") == "Latest"
         assert captured.get("querySource") == "typed_query"
+
+    def test_fetch_search_raises_schema_error_on_unknown_shape(self):
+        """A response missing the known instructions paths is a schema error, not empty results."""
+        client = self._make_client()
+        client._graphql_post = lambda *a, **kw: {"data": {"search_by_raw_query": {"search_timeline": {"brand_new_key": {}}}}}
+        client._graphql_get = lambda *a, **kw: {}  # pragma: no cover
+
+        with pytest.raises(SchemaError):
+            client.fetch_search("python", count=3)
+
+    def test_fetch_search_empty_instructions_is_not_a_schema_error(self):
+        """A present-but-empty instructions list is a legitimate zero-result page."""
+        client = self._make_client()
+        client._graphql_post = lambda *a, **kw: {"data": {"search_by_raw_query": {"search_timeline": {"timeline": {"instructions": []}}}}}
+        client._graphql_get = lambda *a, **kw: {}  # pragma: no cover
+
+        assert client.fetch_search("python", count=3) == []
+
+    def test_fetch_search_falls_back_to_unwrapped_search_timeline_shape(self):
+        """fetch_search tolerates the search_by_raw_query wrapper being dropped."""
+        client = self._make_client()
+
+        tweet_result = {
+            "__typename": "Tweet",
+            "rest_id": "900",
+            "core": {"user_results": {"result": {"rest_id": "u900", "legacy": {"screen_name": "u900user"}}}},
+            "legacy": {
+                "full_text": "hi",
+                "created_at": "Sat Mar 08 13:00:00 +0000 2026",
+                "favorite_count": 0, "retweet_count": 0, "reply_count": 0, "quote_count": 0,
+                "entities": {"urls": []},
+            },
+        }
+        payload = {
+            "data": {
+                "search_timeline": {
+                    "timeline": {
+                        "instructions": [
+                            {
+                                "type": "TimelineAddEntries",
+                                "entries": [
+                                    {
+                                        "entryId": "tweet-900",
+                                        "content": {
+                                            "entryType": "TimelineTimelineItem",
+                                            "itemContent": {"tweet_results": {"result": tweet_result}},
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            },
+        }
+        client._graphql_post = lambda *a, **kw: payload
+        client._graphql_get = lambda *a, **kw: {}  # pragma: no cover
+
+        tweets = client.fetch_search("python", count=3)
+        assert [t.id for t in tweets] == ["900"]
+
+    def test_fetch_search_users_posts_people_product(self):
+        """fetch_search_users targets the People tab and omits userId/includePromotedContent."""
+        client = self._make_client()
+
+        captured = {}
+
+        def mock_post(operation_name, variables, features=None):
+            captured["operation_name"] = operation_name
+            captured["variables"] = variables
+            return {"data": {"search_by_raw_query": {"search_timeline": {"timeline": {"instructions": []}}}}}
+
+        client._graphql_post = mock_post
+        client._graphql_get = lambda *a, **kw: {}  # pragma: no cover
+
+        users = client.fetch_search_users("openai", count=5)
+
+        assert users == []
+        assert captured["operation_name"] == "SearchTimeline"
+        assert captured["variables"]["rawQuery"] == "openai"
+        assert captured["variables"]["querySource"] == "typed_query"
+        assert captured["variables"]["product"] == "People"
+        assert "userId" not in captured["variables"]
+        assert "includePromotedContent" not in captured["variables"]

@@ -491,15 +491,27 @@ def parse_tweet_result(result, depth=0):
 # ── Timeline response parsing ───────────────────────────────────────────
 
 
-def parse_timeline_response(data, get_instructions):
-    # type: (Any, Callable[[Any], Any]) -> Tuple[List[Tweet], Optional[str]]
-    """Parse timeline GraphQL response into tweets and next cursor."""
+def parse_timeline_response(data, get_instructions, context=None):
+    # type: (Any, Callable[[Any], Any], Optional[str]) -> Tuple[List[Tweet], Optional[str]]
+    """Parse timeline GraphQL response into tweets and next cursor.
+
+    `instructions` missing entirely (not a list) means `get_instructions`
+    could not find its expected path — usually because Twitter changed its
+    response schema, not because there are simply no results (a genuine
+    zero-result page still yields a present, if short, instructions list).
+    That distinction matters to callers like `_fetch_timeline`, which can
+    optionally treat it as a hard error via `strict_instructions`; here we
+    only log so non-strict callers keep their current lenient behavior.
+    """
     tweets = []  # type: List[Tweet]
     next_cursor = None  # type: Optional[str]
 
     instructions = get_instructions(data)
     if not isinstance(instructions, list):
-        logger.warning("No timeline instructions found")
+        logger.warning(
+            "No timeline instructions found for %s; the response schema may have changed",
+            context or "timeline",
+        )
         return tweets, next_cursor
 
     for instruction in instructions:
@@ -508,7 +520,11 @@ def parse_timeline_response(data, get_instructions):
             content = entry.get("content", {})
             next_cursor = _extract_cursor(content) or next_cursor
 
-            item_content = content.get("itemContent", {})
+            # `entries` items nest their payload under content.itemContent;
+            # `moduleItems` (TimelineAddToModule continuation pages) nest it
+            # directly under item.itemContent instead — same shape as the
+            # nested `content.items[]` handled below, but one level up.
+            item_content = content.get("itemContent") or _deep_get(entry, "item", "itemContent") or {}
             result = _deep_get(item_content, "tweet_results", "result")
             if result:
                 tweet = parse_tweet_result(result)

@@ -1,0 +1,56 @@
+{
+  "data": {
+    "search_by_raw_query": {
+      "search_timeline": {
+        "timeline": {
+          "instructions": [
+            {
+              "type": "TimelineAddEntries",
+              "entries": [
+                {
+                  "entryId": "user-1",
+                  "content": {
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "user_results": {
+                        "result": {
+                          "rest_id": "s1",
+                          "is_blue_verified": true,
+                          "core": {
+                            "name": "Search User",
+                            "screen_name": "searchuser",
+                            "created_at": "Sat Mar 08 10:00:00 +0000 2026"
+                          },
+                          "legacy": {
+                            "name": "Search User",
+                            "screen_name": "searchuser",
+                            "description": "found via search",
+                            "location": "Internet",
+                            "followers_count": 321,
+                            "friends_count": 12,
+                            "statuses_count": 654,
+                            "favourites_count": 987,
+                            "profile_image_url_https": "https://img/searchuser.jpg",
+                            "created_at": "Sat Mar 08 10:00:00 +0000 2026"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "entryId": "cursor-bottom",
+                  "content": {
+                    "entryType": "TimelineTimelineCursor",
+                    "cursorType": "Bottom",
+                    "value": "search-people-cursor"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

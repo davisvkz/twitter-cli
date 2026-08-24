@@ -163,6 +163,8 @@ twitter search "keyword"               # Search tweets
 twitter search "AI agent" -t Latest --max 50
 twitter search "AI agent" --full-text  # Full text in search results
 twitter search "topic" -o results.json # Save to file
+twitter search "AI agent" --cursor "<next-cursor>"
+twitter search "openai" -t People --json  # Search accounts, not tweets
 twitter tweet 1234567890               # Tweet detail + replies
 twitter tweet 1234567890 --full-text   # Full text in reply table
 twitter tweet https://x.com/user/status/12345  # Accepts URL
@@ -306,6 +308,10 @@ twitter search "rust lang" --max 10 --json | jq '.data[] | {author: .author.scre
 
 # Most engaged tweets
 twitter search "topic" --max 20 --json | jq '.data | sort_by(.metrics.likes) | reverse | .[:5] | .[].id'
+
+# Paginate search results
+CURSOR=$(twitter search "AI" --max 20 --json | jq -r '.pagination.nextCursor // empty')
+twitter search "AI" --max 20 --cursor "$CURSOR" --json
 ```
 
 ## Ranking Filter

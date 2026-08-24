@@ -37,6 +37,7 @@ from .constants import (
 from .exceptions import (
     MediaUploadError,
     NotFoundError,
+    SchemaError,
     TwitterAPIError,
 )
 from .graphql import (
@@ -70,6 +71,30 @@ TimelineInstructionGetter = Callable[[Any], Any]
 
 # Hard ceiling to prevent accidental massive fetches
 _ABSOLUTE_MAX_COUNT = 500
+
+
+def _get_search_instructions(data):
+    # type: (Any) -> Any
+    """Locate SearchTimeline's instructions list, trying known response shapes.
+
+    Uses `is None` checks (not `or`) throughout: an empty-but-present list is a
+    legitimate "no results on this shape" answer and must not fall through to
+    the next candidate, only a missing (`None`) path should.
+    """
+    instructions = _deep_get(
+        data, "data", "search_by_raw_query", "search_timeline", "timeline", "instructions",
+    )
+    if instructions is None:
+        # Versioned container, mirroring the timeline_v2 -> timeline rename
+        # UserTweets went through (see fetch_user_tweets).
+        instructions = _deep_get(
+            data, "data", "search_by_raw_query", "search_timeline",
+            "timeline_v2", "timeline", "instructions",
+        )
+    if instructions is None:
+        # search_by_raw_query wrapper dropped.
+        instructions = _deep_get(data, "data", "search_timeline", "timeline", "instructions")
+    return instructions
 
 
 # ── Session management ───────────────────────────────────────────────────
@@ -345,22 +370,25 @@ class TwitterClient:
             override_base_variables=True,
         )
 
-    def fetch_search(self, query, count=20, product="Top"):
-        # type: (str, int, str) -> List[Tweet]
+    def fetch_search(self, query, count=20, product="Top", cursor=None, return_cursor=False):
+        # type: (str, int, str, Optional[str], bool) -> Any
         """Search tweets by query.
 
         Args:
             query: Search query string.
             count: Max number of tweets to return.
-            product: Search tab — "Top", "Latest", "People", "Photos", "Videos".
+            product: Search tab — "Top", "Latest", "Photos", "Videos". For
+                accounts ("People"), use `fetch_search_users` instead — the
+                People tab returns user results, not tweets.
+            cursor: Optional pagination cursor to resume from.
+            return_cursor: If True, return `(tweets, next_cursor)` instead of
+                just the tweet list.
         """
         # Twitter migrated SearchTimeline from GET to POST — use _graphql_post.
         return self._fetch_timeline(
             "SearchTimeline",
             count,
-            lambda data: _deep_get(
-                data, "data", "search_by_raw_query", "search_timeline", "timeline", "instructions",
-            ),
+            _get_search_instructions,
             extra_variables={
                 "rawQuery": query,
                 "querySource": "typed_query",
@@ -368,6 +396,26 @@ class TwitterClient:
             },
             override_base_variables=True,
             use_post=True,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
+            strict_instructions=True,
+        )
+
+    def fetch_search_users(self, query, count=20):
+        # type: (str, int) -> List[UserProfile]
+        """Search accounts (the People search tab) by query."""
+        return self._fetch_user_list(
+            "SearchTimeline",
+            None,
+            count,
+            _get_search_instructions,
+            use_post=True,
+            extra_variables={
+                "rawQuery": query,
+                "querySource": "typed_query",
+                "product": "People",
+            },
+            override_base_variables=True,
         )
 
     def fetch_tweet_detail(self, tweet_id, count=20):
@@ -749,8 +797,8 @@ class TwitterClient:
 
     # ── Internal: timeline / user list fetchers ──────────────────────
 
-    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False):
-        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool) -> Any
+    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False, strict_instructions=False):
+        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool, bool) -> Any
         """Generic timeline fetcher with pagination and deduplication.
 
         Args:
@@ -759,6 +807,12 @@ class TwitterClient:
                 endpoints like SearchTimeline that reject unknown variables.
             use_post: If True, send request via POST instead of GET. Required for
                 endpoints like SearchTimeline that Twitter migrated to POST.
+            strict_instructions: If True, raise SchemaError when the first page's
+                instructions list cannot be located at all (as opposed to being
+                present but empty) instead of silently returning no results. Only
+                applies to the first page of a fetch, so a transient miss deep into
+                pagination degrades to a warning + early stop rather than discarding
+                tweets already collected.
         """
         if count <= 0:
             return []
@@ -794,7 +848,20 @@ class TwitterClient:
                 data = self._graphql_post(operation_name, variables, FEATURES)
             else:
                 data = self._graphql_get(operation_name, variables, FEATURES, field_toggles=field_toggles)
-            new_tweets, next_cursor = parse_timeline_response(data, get_instructions)
+
+            if strict_instructions and not isinstance(get_instructions(data), list):
+                if attempts == 1 and not tweets:
+                    raise SchemaError(
+                        "%s response did not contain the expected timeline instructions — "
+                        "the Twitter API response schema may have changed." % operation_name
+                    )
+                logger.warning(
+                    "%s: timeline instructions missing on page %d; stopping pagination",
+                    operation_name, attempts,
+                )
+                break
+
+            new_tweets, next_cursor = parse_timeline_response(data, get_instructions, context=operation_name)
 
             for tweet in new_tweets:
                 if tweet.id and tweet.id not in seen_ids:
@@ -824,9 +891,16 @@ class TwitterClient:
             return tweets[:count], continuation_cursor
         return tweets[:count]
 
-    def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False):
-        # type: (str, str, int, Callable[[Any], Any], bool) -> List[UserProfile]
-        """Generic user list fetcher (for followers/following) with pagination."""
+    def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False, extra_variables=None, override_base_variables=False):
+        # type: (str, Optional[str], int, Callable[[Any], Any], bool, Optional[Dict[str, Any]], bool) -> List[UserProfile]
+        """Generic user list fetcher (for followers/following/search) with pagination.
+
+        Args:
+            override_base_variables: If True, use only extra_variables +
+                count/cursor instead of the default userId-based variables.
+                Needed for endpoints like SearchTimeline that reject unknown
+                variables and don't take a userId.
+        """
         if count <= 0:
             return []
         count = min(count, self._max_count)
@@ -838,11 +912,17 @@ class TwitterClient:
 
         while len(users) < count and attempts < max_attempts:
             attempts += 1
-            variables = {
-                "userId": user_id,
-                "count": min(count - len(users) + 5, 40),
-                "includePromotedContent": False,
-            }  # type: Dict[str, Any]
+            variables: Dict[str, Any]
+            if override_base_variables:
+                variables = {"count": min(count - len(users) + 5, 40)}
+            else:
+                variables = {
+                    "userId": user_id,
+                    "count": min(count - len(users) + 5, 40),
+                    "includePromotedContent": False,
+                }
+            if extra_variables:
+                variables.update(extra_variables)
             if cursor:
                 variables["cursor"] = cursor
 

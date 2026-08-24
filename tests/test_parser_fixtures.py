@@ -107,3 +107,54 @@ def test_fetch_user_list_with_fixture(monkeypatch, fixture_loader) -> None:
     assert len(users) == 1
     assert users[0].screen_name == "follower1"
     assert users[0].verified is True
+
+
+def test_fetch_search_users_with_fixture(monkeypatch, fixture_loader) -> None:
+    client = _make_client()
+    payload = fixture_loader("search_people.json")
+    monkeypatch.setattr(client, "_graphql_post", lambda operation_name, variables, features=None: payload)
+
+    users = client.fetch_search_users("searchuser", 20)
+
+    assert [u.screen_name for u in users] == ["searchuser"]
+    assert users[0].verified is True
+    assert users[0].followers_count == 321
+
+
+def test_parse_timeline_response_reads_module_items_entries() -> None:
+    """`moduleItems` (TimelineAddToModule continuation pages) nest their payload
+
+    directly under `item.itemContent`, not `content.itemContent` like regular
+    `entries`. Regression guard: this shape used to silently parse to zero tweets.
+    """
+    tweet_result = {
+        "__typename": "Tweet",
+        "rest_id": "600",
+        "core": {"user_results": {"result": {"rest_id": "u600", "legacy": {"screen_name": "moduser"}}}},
+        "legacy": {
+            "full_text": "module continuation tweet",
+            "created_at": "Sat Mar 08 13:00:00 +0000 2026",
+            "favorite_count": 1, "retweet_count": 0, "reply_count": 0, "quote_count": 0,
+            "entities": {"urls": []},
+        },
+    }
+    payload = {
+        "data": {
+            "instructions": [
+                {
+                    "type": "TimelineAddToModule",
+                    "moduleItems": [
+                        {
+                            "entryId": "search-module-1-tweet-600",
+                            "item": {"itemContent": {"tweet_results": {"result": tweet_result}}},
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+
+    tweets, cursor = parse_timeline_response(payload, lambda data: _deep_get(data, "data", "instructions"))
+
+    assert [tweet.id for tweet in tweets] == ["600"]
+    assert cursor is None
