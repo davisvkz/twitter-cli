@@ -171,9 +171,9 @@ twitter tweet https://x.com/user/status/12345  # Accepts URL
 twitter show 2                         # Open tweet #2 from last feed/search list
 twitter show 2 --full-text             # Full text in reply table
 twitter show 2 --json                  # Structured output
-twitter list 1539453138322673664       # List timeline
-twitter list 1539453138322673664 --cursor "<next-cursor>"
-twitter list 1539453138322673664 --full-text
+twitter list <list-id>                 # List timeline; ID is the number in x.com/i/lists/<list-id>
+twitter list <list-id> --cursor "<next-cursor>"
+twitter list <list-id> --full-text
 twitter user-posts elonmusk --max 20   # User's tweets
 twitter user-posts elonmusk --full-text
 twitter likes elonmusk --max 30        # User's likes (own only, see note)

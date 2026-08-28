@@ -136,10 +136,10 @@ twitter article https://x.com/user/article/1234567890 --json
 twitter article 1234567890 --markdown
 twitter article 1234567890 --output article.md
 
-# List timeline
-twitter list 1539453138322673664
-twitter list 1539453138322673664 --cursor "<next-cursor-from-previous-response>"
-twitter list 1539453138322673664 --full-text
+# List timeline (list ID is the number in https://x.com/i/lists/<list-id>)
+twitter list <list-id>
+twitter list <list-id> --cursor "<next-cursor-from-previous-response>"
+twitter list <list-id> --full-text
 
 # User
 twitter user elonmusk
@@ -461,10 +461,10 @@ twitter article https://x.com/user/article/1234567890 --json
 twitter article 1234567890 --markdown
 twitter article 1234567890 --output article.md
 
-# 列表时间线
-twitter list 1539453138322673664
-twitter list 1539453138322673664 --cursor "<上一页返回的 nextCursor>"
-twitter list 1539453138322673664 --full-text
+# 列表时间线（列表 ID 是 https://x.com/i/lists/<list-id> 中的数字）
+twitter list <list-id>
+twitter list <list-id> --cursor "<上一页返回的 nextCursor>"
+twitter list <list-id> --full-text
 
 # 用户
 twitter user elonmusk

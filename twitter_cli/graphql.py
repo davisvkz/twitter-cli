@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Any, Dict, Optional  # noqa: F401
 
+from x_client_transaction.utils import get_ondemand_file_url
+
 from .exceptions import QueryIdError
 
 logger = logging.getLogger(__name__)
@@ -26,27 +28,33 @@ TWITTER_OPENAPI_URL = (
 )
 
 # ── Fallback (hardcoded) queryIds ────────────────────────────────────────
+# Source of truth: TWITTER_OPENAPI_URL above (community-maintained). Values
+# below were refreshed 2026-08-28 against that source — X rotates these
+# often, so a stale fallback here isn't fatal (see the 404/422 self-heal in
+# TwitterClient._graphql_get/_graphql_post) but costs a wasted round-trip
+# per call until it does. BookmarkFoldersSlice/BookmarkFolderTimeline have
+# no live entry in the community source as of this refresh; left as-is.
 FALLBACK_QUERY_IDS = {
-    "HomeTimeline": "c-CzHF1LboFilMpsx4ZCrQ",
-    "HomeLatestTimeline": "BKB7oi212Fi7kQtCBGE4zA",
-    "UserByScreenName": "1VOOyvKkiI3FMmkeDNxM9A",
-    "UserTweets": "q6xj5bs0hapm9309hexA_g",
-    "TweetDetail": "xd_EMdYvB9hfZsZ6Idri0w",
-    "Likes": "lIDpu_NWL7_VhimGGt0o6A",
-    "SearchTimeline": "VhUd6vHVmLBcw0uX-6jMLA",
-    "Bookmarks": "2neUNDqrrFzbLui8yallcQ",
-    "ListLatestTweetsTimeline": "RlZzktZY_9wJynoepm8ZsA",
-    "Followers": "IOh4aS6UdGWGJUYTqliQ7Q",
-    "Following": "zx6e-TLzRkeDO_a7p4b3JQ",
-    "CreateTweet": "IID9x6WsdMnTlXnzXGq8ng",
+    "HomeTimeline": "7zlnp2TxC044W4C1ZUJMHw",
+    "HomeLatestTimeline": "0dateTVgvXjpkf7kyBZy0g",
+    "UserByScreenName": "IGgvgiOx4QZndDHuD3x9TQ",
+    "UserTweets": "36rb3Xj3iJ64Q-9wKDjCcQ",
+    "TweetDetail": "oCon7R-cgWRFy6EfZjaKfg",
+    "Likes": "rk2aeVVvKsyUdG3jf5uiLw",
+    "SearchTimeline": "Yw6L66Pw54NHKuq4Dp7b4Q",
+    "Bookmarks": "XD0ViOeSOW4YoeNTGjVaYw",
+    "ListLatestTweetsTimeline": "FVWmROVvhgjRPC-4jAUh8A",
+    "Followers": "_orfRBQae57vylFPH0Huhg",
+    "Following": "F42cDX8PDFxkbjjq6JrM2w",
+    "CreateTweet": "5CdvsV_zjv4L64XFifAglw",
     "DeleteTweet": "VaenaVgh5q5ih7kvyVjgtg",
     "FavoriteTweet": "lI07N6Otwv1PhnEgXILM7A",
     "UnfavoriteTweet": "ZYKSe-w7KEslx3JhSIk5LA",
-    "CreateRetweet": "ojPdsZsimiJrUGLR1sjUtA",
-    "DeleteRetweet": "iQtK4dl5hBmXewYZuEOKVw",
+    "CreateRetweet": "mbRO74GrOvSfRcJnlMapnQ",
+    "DeleteRetweet": "ZyZigVsNiFO6v1dEks1eWg",
     "CreateBookmark": "aoDbu3RHznuiSkQ9aNM67Q",
     "DeleteBookmark": "Wlmlj2-xzyS1GN3a6cj-mQ",
-    "TweetResultByRestId": "7xflPyRiUxGVbJd4uWmbfg",
+    "TweetResultByRestId": "tCVRZ3WCvoj0BVO7BKnL-Q",
     "BookmarkFoldersSlice": "i78YDd0Tza-dV4SYs58kRg",
     "BookmarkFolderTimeline": "hNY7X2xE2N7HVF6Qb_mu6w",
 }
@@ -174,6 +182,35 @@ def _update_features_from_html(html):
             logger.info("Updated %d feature flags from x.com", found)
     except Exception as exc:
         logger.debug("Feature extraction from HTML failed: %s", exc)
+
+
+def _extract_ondemand_url(html):
+    # type: (str) -> Optional[str]
+    """Locate the URL of x.com's `ondemand.s.<hash>a.js` bundle inside homepage HTML.
+
+    x.com embeds a webpack chunk-id -> chunk-name map used to build this URL. The
+    upstream x_client_transaction library expects the legacy shape
+    `"ondemand.s":"<hash>"`, but the site has since inverted it to
+    `<chunkId>:"ondemand.s"`, with the hash living in a separate chunkId -> hash map
+    elsewhere in the same document (e.g. `59924:"ondemand.s"` ... `59924:"7344ba9121cdf02c"`).
+    Try the legacy shape first (in case it ever reverts), then fall back to the
+    inverted-map shape actually observed in production.
+    """
+    try:
+        url = get_ondemand_file_url(response=html)
+    except Exception:
+        url = None
+    if url:
+        return url
+
+    chunk_id_match = re.search(r'(\d+):"ondemand\.s"', html)
+    if not chunk_id_match:
+        return None
+    chunk_id = chunk_id_match.group(1)
+    hash_match = re.search(r'\b%s:"([0-9a-f]{6,})"' % re.escape(chunk_id), html)
+    if not hash_match:
+        return None
+    return "https://abs.twimg.com/responsive-web/client-web/ondemand.s.%sa.js" % hash_match.group(1)
 
 
 def _fetch_from_github(url_fetch_fn, operation_name):

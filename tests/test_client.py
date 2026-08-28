@@ -14,9 +14,10 @@ import pytest
 
 from twitter_cli.client import (
     _best_chrome_target,
+    _extract_ondemand_url,
     TwitterClient,
 )
-from twitter_cli.exceptions import SchemaError, TwitterAPIError
+from twitter_cli.exceptions import NotFoundError, SchemaError, TwitterAPIError
 from twitter_cli.graphql import (
     FEATURES,
     FALLBACK_QUERY_IDS,
@@ -207,8 +208,13 @@ class TestBuildGraphqlUrl:
         assert len(url) < 8000, f"URL too long: {len(url)} chars"
 
     def test_searchtimeline_fallback_query_id_regression(self):
-        """Keep SearchTimeline fallback aligned with the live operation after issue #39."""
-        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "VhUd6vHVmLBcw0uX-6jMLA"
+        """Keep SearchTimeline fallback aligned with the live operation after issue #39.
+
+        Value refreshed 2026-08-28 against the community-maintained queryId
+        source (see graphql.py's FALLBACK_QUERY_IDS comment) — X rotated it
+        again since the #39 fix.
+        """
+        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "Yw6L66Pw54NHKuq4Dp7b4Q"
 
 
 # ── _best_chrome_target ──────────────────────────────────────────────────
@@ -261,6 +267,38 @@ class TestUpdateFeaturesFromHtml:
 
     def test_handles_malformed_html(self):
         _update_features_from_html("not json at all {{{")
+
+
+# ── _extract_ondemand_url ──────────────────────────────────────────────
+
+class TestExtractOndemandUrl:
+    def test_legacy_map_uses_library_parser(self):
+        html = '{"foo":1,"ondemand.s":"abc123def456","bar":2}'
+        url = _extract_ondemand_url(html)
+        assert url == "https://abs.twimg.com/responsive-web/client-web/ondemand.s.abc123def456a.js"
+
+    def test_inverted_chunk_map_fallback(self):
+        # X's current shape: unquoted-key JS object with <chunkId>:"ondemand.s",
+        # hash lives in a separate <chunkId>:"<hash>" entry elsewhere in the doc.
+        html = (
+            '{88930:"ondemand.countries-bn",59924:"ondemand.s",'
+            '89225:"shared~bundle.Ocf",...,59924:"7344ba9121cdf02c"}'
+        )
+        url = _extract_ondemand_url(html)
+        assert url == "https://abs.twimg.com/responsive-web/client-web/ondemand.s.7344ba9121cdf02ca.js"
+
+    def test_ignores_chunk_id_substring_match(self):
+        # A decoy "159924" must not be mistaken for chunk id "59924".
+        html = '59924:"ondemand.s",159924:"deadbeefcafe0",59924:"7344ba9121cdf02c"'
+        url = _extract_ondemand_url(html)
+        assert url == "https://abs.twimg.com/responsive-web/client-web/ondemand.s.7344ba9121cdf02ca.js"
+
+    def test_returns_none_on_logged_out_shell(self):
+        assert _extract_ondemand_url("<html><body>no chunk map here</body></html>") is None
+
+    def test_returns_none_when_hash_map_absent(self):
+        html = '"59924":"ondemand.s"'  # chunk id present, no matching hash entry
+        assert _extract_ondemand_url(html) is None
 
 
 # ── TwitterClient._build_headers ─────────────────────────────────────────
@@ -451,6 +489,74 @@ class TestPaginationBehavior:
         assert calls[0][0] == "ListLatestTweetsTimeline"
         assert calls[0][1]["listId"] == "list-1"
         assert calls[0][1]["cursor"] == "cursor-prev"
+
+    def test_fetch_list_timeline_raises_not_found_for_inaccessible_list(self):
+        # Verified live shape for a private/deleted/restricted list: the
+        # "list" container is present but empty.
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+        client._graphql_get = lambda *a, **k: {"data": {"list": {"tweets_timeline": {}}}}
+
+        with pytest.raises(NotFoundError):
+            client.fetch_list_timeline("list-1", 1)
+
+    def test_fetch_list_timeline_accepts_empty_but_present_timeline(self):
+        # A real, accessible list can legitimately have zero current tweets.
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+        client._graphql_get = lambda *a, **k: {
+            "data": {"list": {"tweets_timeline": {"timeline": {"instructions": []}}}}
+        }
+
+        assert client.fetch_list_timeline("list-1", 1) == []
+
+    def test_fetch_tweet_detail_raises_not_found_for_missing_tweet(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+        client._graphql_get = lambda *a, **k: {
+            "data": {"threaded_conversation_with_injections_v2": {"instructions": []}}
+        }
+
+        with pytest.raises(NotFoundError):
+            client.fetch_tweet_detail("999")
+
+    def test_fetch_tweet_detail_raises_not_found_with_tombstone_text(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0.0
+        client._max_count = 200
+        client._graphql_get = lambda *a, **k: {
+            "data": {
+                "threaded_conversation_with_injections_v2": {
+                    "instructions": [
+                        {
+                            "entries": [
+                                {
+                                    "entryId": "tweet-999",
+                                    "content": {
+                                        "itemContent": {
+                                            "tweet_results": {
+                                                "result": {
+                                                    "__typename": "TweetTombstone",
+                                                    "tombstone": {
+                                                        "text": {"text": "This Tweet was deleted."}
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    },
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+
+        with pytest.raises(NotFoundError, match="This Tweet was deleted."):
+            client.fetch_tweet_detail("999")
 
     def test_fetch_search_accepts_cursor_and_returns_cursor(self):
         client = TwitterClient.__new__(TwitterClient)

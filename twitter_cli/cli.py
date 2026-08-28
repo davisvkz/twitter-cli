@@ -1223,8 +1223,9 @@ def _write_action(emoji, action_desc, client_method, tweet_id, as_json=False, as
     action_name = action_desc.lower().replace(" ", "_")
 
     def operation(client: TwitterClient) -> WritePayload:
-        getattr(client, client_method)(tweet_id)
-        return {"success": True, "action": action_name, "id": tweet_id}
+        normalized_id = _normalize_tweet_id(tweet_id)
+        getattr(client, client_method)(normalized_id)
+        return {"success": True, "action": action_name, "id": normalized_id}
 
     _run_write_command(
         as_json=as_json,

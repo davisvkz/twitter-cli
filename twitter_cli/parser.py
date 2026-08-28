@@ -554,3 +554,41 @@ def parse_timeline_response(data, get_instructions, context=None):
                         tweets.append(tweet)
 
     return tweets, next_cursor
+
+
+def extract_tombstone_text(instructions):
+    # type: (Any) -> Optional[str]
+    """Return X's tombstone copy when a timeline holds only tombstones, no tweets.
+
+    `parse_tweet_result` silently drops `TweetTombstone` results (deleted,
+    suspended, or protected tweets), which is right for normal timelines —
+    a few unavailable replies shouldn't break the rest. But when the whole
+    timeline is nothing but tombstones (e.g. `TweetDetail` for a deleted or
+    protected tweet), the reason X gives is worth surfacing instead of just
+    reporting "not found". Returns None as soon as any real tweet is found —
+    a thread with some tombstoned replies is not "not found".
+    """
+    if not isinstance(instructions, list):
+        return None
+
+    tombstone_text = None  # type: Optional[str]
+    for instruction in instructions:
+        entries = instruction.get("entries") or instruction.get("moduleItems") or []
+        for entry in entries:
+            content = entry.get("content", {})
+            item_content = content.get("itemContent") or _deep_get(entry, "item", "itemContent") or {}
+
+            tweet_result = _deep_get(item_content, "tweet_results", "result") or {}
+            if tweet_result.get("__typename") == "TweetTombstone":
+                text = _deep_get(tweet_result, "tombstone", "text", "text")
+                if text:
+                    tombstone_text = tombstone_text or text
+                continue
+            if tweet_result:
+                return None  # a real tweet is present — not a "not found" case
+
+            rich_text = _deep_get(item_content, "tombstoneInfo", "richText", "text")
+            if rich_text:
+                tombstone_text = tombstone_text or rich_text
+
+    return tombstone_text

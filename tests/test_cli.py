@@ -213,6 +213,50 @@ def test_cli_user_error_yaml(monkeypatch) -> None:
     assert payload["error"]["code"] == "not_found"
 
 
+def test_cli_tweet_reports_not_found_for_missing_tweet(monkeypatch) -> None:
+    from twitter_cli.exceptions import NotFoundError
+
+    class FakeClient:
+        def fetch_tweet_detail(self, tweet_id: str, max_count: int):
+            raise NotFoundError("Tweet %s not found" % tweet_id)
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["tweet", "999", "--yaml"])
+
+    assert result.exit_code == 1
+    payload = yaml.safe_load(result.output)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_found"
+
+
+def test_cli_list_reports_not_found_for_inaccessible_list(monkeypatch) -> None:
+    from twitter_cli.exceptions import NotFoundError
+
+    class FakeClient:
+        def fetch_list_timeline(self, list_id, count, cursor=None, return_cursor=False):
+            raise NotFoundError("List %s not found or not accessible" % list_id)
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["list", "12345", "--yaml"])
+
+    assert result.exit_code == 1
+    payload = yaml.safe_load(result.output)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_found"
+
+
 def test_cli_tweet_accepts_shared_url_with_query(monkeypatch) -> None:
     class FakeClient:
         def fetch_tweet_detail(self, tweet_id: str, max_count: int):
@@ -612,6 +656,46 @@ def test_cli_like_yaml_output(monkeypatch) -> None:
     assert payload["ok"] is True
     assert payload["data"]["action"] == "liking_tweet"
     assert payload["data"]["id"] == "123"
+
+
+def test_cli_like_accepts_status_url(monkeypatch) -> None:
+    class FakeClient:
+        def like_tweet(self, tweet_id: str) -> bool:
+            assert tweet_id == "123"
+            return True
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["like", "https://x.com/alice/status/123?s=20", "--yaml"])
+    assert result.exit_code == 0
+    payload = yaml.safe_load(result.output)
+    assert payload["data"]["id"] == "123"
+
+
+def test_cli_delete_accepts_status_url(monkeypatch) -> None:
+    class FakeClient:
+        def delete_tweet(self, tweet_id: str) -> bool:
+            assert tweet_id == "123"
+            return True
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["delete", "https://x.com/alice/status/123", "--yes", "--yaml"])
+    assert result.exit_code == 0
+    payload = yaml.safe_load(result.output)
+    assert payload["data"]["id"] == "123"
+
+
+def test_cli_write_action_rejects_invalid_url(monkeypatch) -> None:
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: object())
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["like", "https://x.com/alice/not-a-status/123", "--yaml"])
+    assert result.exit_code == 1
+    payload = yaml.safe_load(result.output)
+    assert payload["ok"] is False
 
 
 def test_cli_follow_json_output(monkeypatch) -> None:

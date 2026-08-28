@@ -171,14 +171,8 @@ def test_verify_cookies_logs_attempt_summary_on_non_auth_failures(monkeypatch, c
             return self._payload
 
     class Session:
-        def __init__(self) -> None:
-            self.calls = 0
-
         def get(self, url, headers=None, timeout=5):
-            self.calls += 1
-            if self.calls == 1:
-                return Response(404)
-            raise Exception("network")
+            return Response(404)
 
     monkeypatch.setattr("twitter_cli.client._get_cffi_session", lambda: Session())
 
@@ -186,8 +180,49 @@ def test_verify_cookies_logs_attempt_summary_on_non_auth_failures(monkeypatch, c
         result = auth.verify_cookies("token", "csrf")
 
     assert result == {}
-    assert "verify_credentials.json=404" in caplog.text
-    assert "settings.json=Exception" in caplog.text
+    assert "list.json=404" in caplog.text
+    assert "will verify on first API call" in caplog.text
+
+
+def test_verify_cookies_returns_screen_name_from_multi_list(monkeypatch) -> None:
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"users": [{"screen_name": "alice"}]}
+
+    class Session:
+        def __init__(self) -> None:
+            self.requested_urls = []
+
+        def get(self, url, headers=None, timeout=5):
+            self.requested_urls.append(url)
+            return Response()
+
+    session = Session()
+    monkeypatch.setattr("twitter_cli.client._get_cffi_session", lambda: session)
+
+    result = auth.verify_cookies("token", "csrf")
+
+    assert result == {"screen_name": "alice"}
+    assert session.requested_urls == ["https://x.com/i/api/1.1/account/multi/list.json"]
+
+
+def test_verify_cookies_raises_on_401(monkeypatch) -> None:
+    class Response:
+        status_code = 401
+
+        def json(self):
+            return {}
+
+    class Session:
+        def get(self, url, headers=None, timeout=5):
+            return Response()
+
+    monkeypatch.setattr("twitter_cli.client._get_cffi_session", lambda: Session())
+
+    with pytest.raises(auth.AuthenticationError):
+        auth.verify_cookies("token", "csrf")
 
 
 def test_iter_chrome_cookie_files_default_first(monkeypatch, tmp_path) -> None:

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, cast
 import bs4
 from curl_cffi import requests as _cffi_requests
 from x_client_transaction import ClientTransaction
-from x_client_transaction.utils import generate_headers as _gen_ct_headers, get_ondemand_file_url
+from x_client_transaction.utils import generate_headers as _gen_ct_headers
 
 from .constants import (
     BEARER_TOKEN,
@@ -44,6 +44,7 @@ from .graphql import (
     FALLBACK_QUERY_IDS,
     FEATURES,
     _build_graphql_url,
+    _extract_ondemand_url,
     _invalidate_query_id,
     _resolve_query_id,
     _update_features_from_html,
@@ -52,6 +53,7 @@ from .models import BookmarkFolder, UserProfile
 from .parser import (
     _deep_get,
     _parse_int,
+    extract_tombstone_text,
     parse_timeline_response,
     parse_tweet_result,
     parse_user_result,
@@ -421,11 +423,25 @@ class TwitterClient:
     def fetch_tweet_detail(self, tweet_id, count=20):
         # type: (str, int) -> List[Tweet]
         """Fetch a tweet and its conversation thread (replies)."""
-        return self._fetch_timeline(
+        get_instructions = lambda data: (  # noqa: E731
+            _deep_get(data, "data", "tweetResult", "result", "timeline", "instructions")
+            or _deep_get(data, "data", "threaded_conversation_with_injections_v2", "instructions")
+        )
+
+        def not_found_check(data):
+            # type: (Any) -> Optional[str]
+            instructions = get_instructions(data)
+            if not instructions:
+                return "Tweet %s not found (deleted, protected, or an invalid ID)" % tweet_id
+            tombstone_text = extract_tombstone_text(instructions)
+            if tombstone_text:
+                return "Tweet %s is not available: %s" % (tweet_id, tombstone_text)
+            return None
+
+        tweets = self._fetch_timeline(
             "TweetDetail",
             count,
-            lambda data: _deep_get(data, "data", "tweetResult", "result", "timeline", "instructions")
-            or _deep_get(data, "data", "threaded_conversation_with_injections_v2", "instructions"),
+            get_instructions,
             extra_variables={
                 "focalTweetId": tweet_id,
                 "referrer": "tweet",
@@ -444,7 +460,11 @@ class TwitterClient:
                 "withGrokAnalyze": False,
                 "withDisallowedReplyControls": False,
             },
+            not_found_check=not_found_check,
         )
+        if not tweets:
+            raise NotFoundError("Tweet %s not found (deleted, protected, or an invalid ID)" % tweet_id)
+        return tweets
 
     def fetch_article(self, tweet_id):
         # type: (str) -> Tweet
@@ -488,6 +508,16 @@ class TwitterClient:
     def fetch_list_timeline(self, list_id, count=20, cursor=None, return_cursor=False):
         # type: (str, int, Optional[str], bool) -> Any
         """Fetch tweets from a Twitter List."""
+
+        def not_found_check(data):
+            # type: (Any) -> Optional[str]
+            list_result = _deep_get(data, "data", "list")
+            if not isinstance(list_result, dict):
+                return None  # unrecognized shape — leave to strict_instructions below
+            if not _deep_get(list_result, "tweets_timeline", "timeline"):
+                return "List %s not found or not accessible (private, deleted, or restricted)" % list_id
+            return None
+
         return self._fetch_timeline(
             "ListLatestTweetsTimeline",
             count,
@@ -496,6 +526,7 @@ class TwitterClient:
             override_base_variables=True,
             start_cursor=cursor,
             return_cursor=return_cursor,
+            not_found_check=not_found_check,
         )
 
     def fetch_followers(self, user_id, count=20):
@@ -797,8 +828,8 @@ class TwitterClient:
 
     # ── Internal: timeline / user list fetchers ──────────────────────
 
-    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False, strict_instructions=False):
-        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool, bool) -> Any
+    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False, strict_instructions=False, not_found_check=None):
+        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool, bool, Optional[Callable[[Any], Optional[str]]]) -> Any
         """Generic timeline fetcher with pagination and deduplication.
 
         Args:
@@ -813,6 +844,14 @@ class TwitterClient:
                 applies to the first page of a fetch, so a transient miss deep into
                 pagination degrades to a warning + early stop rather than discarding
                 tweets already collected.
+            not_found_check: Optional callable run against the first page's raw
+                response. Returning a message raises NotFoundError with that
+                message; returning None means "not a not-found case" (falls
+                through to strict_instructions / normal parsing). Distinguishes
+                "the requested resource doesn't exist or isn't accessible" (a
+                container is present but empty, e.g. an inaccessible list) from
+                a genuine schema change (the container itself is missing) and
+                from a legitimately empty result page.
         """
         if count <= 0:
             return []
@@ -848,6 +887,11 @@ class TwitterClient:
                 data = self._graphql_post(operation_name, variables, FEATURES)
             else:
                 data = self._graphql_get(operation_name, variables, FEATURES, field_toggles=field_toggles)
+
+            if not_found_check is not None and attempts == 1 and not tweets:
+                not_found_reason = not_found_check(data)
+                if not_found_reason:
+                    raise NotFoundError(not_found_reason)
 
             if strict_instructions and not isinstance(get_instructions(data), list):
                 if attempts == 1 and not tweets:
@@ -1181,13 +1225,21 @@ class TwitterClient:
             # Use curl_cffi for ClientTransaction init to maintain consistent
             # Chrome TLS fingerprint. Using Python requests here would leak
             # a different TLS fingerprint on the same IP — a detection vector.
+            #
+            # The logged-out homepage ships without the webpack chunk map that
+            # ondemand-bundle discovery relies on, so authenticate this request
+            # the same way authenticated API calls are (Cookie header) to get
+            # the full logged-in bundle.
             cffi_session = _get_cffi_session()
             ct_headers = _gen_ct_headers()
+            ct_headers["Cookie"] = self._cookie_string or "auth_token=%s; ct0=%s" % (
+                self._auth_token, self._ct0,
+            )
             home_page = cffi_session.get(
                 "https://x.com", headers=ct_headers, timeout=10,
             )
             home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
-            ondemand_url = get_ondemand_file_url(response=home_page_response)
+            ondemand_url = _extract_ondemand_url(home_page.text)
             if not ondemand_url:
                 raise ValueError("Failed to extract ondemand file URL from homepage")
             ondemand_file = cffi_session.get(

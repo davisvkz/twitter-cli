@@ -106,9 +106,13 @@ def verify_cookies(auth_token: str, ct0: str, cookie_string: Optional[str] = Non
     """
     from .client import _get_cffi_session
 
+    # verify_credentials.json and account/settings.json both now 404 for every
+    # request (verified live) — X retired them. account/multi/list.json is the
+    # endpoint fetch_me() already relies on: authenticated, live, and requires
+    # no queryId/features. Kept as a list so a future replacement stays a
+    # one-line change.
     urls = [
-        "https://api.x.com/1.1/account/verify_credentials.json",
-        "https://x.com/i/api/1.1/account/settings.json",
+        "https://x.com/i/api/1.1/account/multi/list.json",
     ]
 
     # Use full cookie string if available, otherwise minimal
@@ -144,7 +148,9 @@ def verify_cookies(auth_token: str, ct0: str, cookie_string: Optional[str] = Non
                 data = resp.json()
                 attempts.append("%s=200" % endpoint)
                 logger.debug("Cookie verification succeeded via %s", endpoint)
-                return {"screen_name": data.get("screen_name", "")}
+                users = data.get("users") if isinstance(data, dict) else None
+                screen_name = users[0].get("screen_name", "") if users else ""
+                return {"screen_name": screen_name}
             attempts.append("%s=%d" % (endpoint, resp.status_code))
             logger.debug("Verification endpoint %s returned HTTP %d, trying next...", url, resp.status_code)
             continue
